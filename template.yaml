@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  athlenz-event-ingestor — standalone Strava webhook ingest function.
+  Plain Java 21 on Lambda (no framework), fronted by API Gateway, enqueuing
+  validated activity events to SQS for a downstream processor.
+
+Parameters:
+  StravaVerifyToken:
+    Type: String
+    NoEcho: true
+    Description: >
+      The verify token Strava echoes back during the subscription validation
+      handshake. Any hard-to-guess string you invent.
+
+Globals:
+  Function:
+    Runtime: java21
+    # Lambda scales CPU with memory, so more memory shortens the Java init /
+    # cold start. The Strava subscription handshake must answer within ~2s, and
+    # a cold start at 512 MB can exceed that; 1024 MB roughly halves init time.
+    MemorySize: 1024
+    # A Java cold start can be slow; the validation handshake must answer within
+    # 2s, but event deliveries only need a fast ack. 15s leaves headroom.
+    Timeout: 15
+    Architectures:
+      - x86_64
+
+Resources:
+
+  # ---- SQS queue (+ DLQ) that ingest publishes validated events to ----
+  EventDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  EventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      # Hold each event briefly before the processor can receive it. Strava
+      # fires the webhook the instant an activity is created, but the detailed
+      # activity can take a few seconds to become queryable via the API. A short
+      # delivery delay lets that propagation finish so the processor's first
+      # fetch does not race it and get a spurious 404. 15s covers the common
+      # case; genuinely slow activities are still caught by the retry/redrive
+      # path below (ReportBatchItemFailures -> visibility timeout -> DLQ).
+      # This delay sits between ingest and the processor only; it does NOT
+      # affect how fast the ingest function answers Strava's handshake/ack.
+      DelaySeconds: 15
+      # This queue is OWNED by the ingest stack but CONSUMED by the processor
+      # (athlenz-event-processor). For an SQS-triggered
+      # Lambda the visibility timeout should be at least ~6x the consumer's
+      # function timeout (the processor runs with a 30s timeout), so it is set
+      # to 180s here to suit the consumer, not the producer.
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventDlq.Arn
+        maxReceiveCount: 5
+
+  # ---- Ingest function + API ----
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: io.cb.strava.ingest.WebhookHandler::handleRequest
+      # SnapStart largely eliminates the Java cold start that can blow past
+      # Strava's ~2s validation-handshake window. Lambda takes a snapshot of the
+      # initialized execution environment (after the init phase) and restores
+      # from it, so the per-athlete first request no longer pays the full JVM +
+      # class-load + client-construction cost. SnapStart applies only to a
+      # PUBLISHED version, so AutoPublishAlias is set: SAM publishes a new
+      # version on each deploy and points the API at the "live" alias.
+      SnapStart:
+        ApplyOn: PublishedVersions
+      AutoPublishAlias: live
+      Environment:
+        Variables:
+          STRAVA_VERIFY_TOKEN: !Ref StravaVerifyToken
+          EVENT_QUEUE_URL: !Ref EventQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt EventQueue.QueueName
+      Events:
+        Validate:
+          Type: Api
+          Properties:
+            Path: /webhook
+            Method: get
+            RestApiId: !Ref WebhookApi
+        Receive:
+          Type: Api
+          Properties:
+            Path: /webhook
+            Method: post
+            RestApiId: !Ref WebhookApi
+
+  WebhookApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+
+Outputs:
+  WebhookUrl:
+    Description: Public callback URL to register with Strava.
+    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/prod/webhook"
+  EventQueueUrl:
+    Description: SQS queue receiving validated activity events.
+    Value: !Ref EventQueue
+  EventQueueArn:
+    Description: >
+      ARN of the event queue. Pass this to the processor stack
+      (athlenz-event-processor) as its EventQueueArn parameter so it consumes this
+      queue instead of creating its own.
+    Value: !GetAtt EventQueue.Arn
+  EventQueueName:
+    Description: >
+      Name of the event queue. Pass this to the processor stack as its
+      EventQueueName parameter (used to scope the SQS poller IAM policy).
+    Value: !GetAtt EventQueue.QueueName
+  EventDlqUrl:
+    Description: Dead-letter queue for events that repeatedly fail processing.
+    Value: !Ref EventDlq

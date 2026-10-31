@@ -1,0 +1,208 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>io.cb.strava</groupId>
+    <artifactId>athlenz-event-ingestor</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <!--
+      Standalone Strava webhook INGEST function.
+
+      Plain Java 21 on the AWS Lambda java21 runtime, built with Maven and
+      deployed with the AWS SAM CLI. No application framework: the handler
+      implements the AWS Lambda RequestHandler directly against the API Gateway
+      proxy event types. Helper libraries only (Jackson for JSON, AWS SDK v2
+      for SQS).
+
+      It handles the two Strava webhook interactions on a single callback URL:
+        - GET  : subscription validation handshake (echo hub.challenge when the
+                 hub.verify_token matches STRAVA_VERIFY_TOKEN).
+        - POST : fast-ack event delivery; valid activity events are enqueued to
+                 SQS and the function returns 200 immediately.
+
+      The maven-shade-plugin produces a single fat jar that Lambda runs.
+    -->
+
+    <properties>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- AWS SDK v2 BOM: pin only the modules we use. -->
+        <aws.sdk.version>2.28.16</aws.sdk.version>
+
+        <!-- AWS Lambda Java libraries. -->
+        <aws.lambda.core.version>1.2.3</aws.lambda.core.version>
+        <aws.lambda.events.version>3.11.4</aws.lambda.events.version>
+
+        <!-- Jackson for JSON (de)serialization. -->
+        <jackson.version>2.17.2</jackson.version>
+
+        <!-- SLF4J + simple backend (stdout -> CloudWatch via Lambda). -->
+        <slf4j.version>2.0.13</slf4j.version>
+
+        <!-- Test. -->
+        <junit.version>5.10.3</junit.version>
+        <mockito.version>5.12.0</mockito.version>
+
+        <!-- Plugins. -->
+        <maven.compiler.plugin.version>3.13.0</maven.compiler.plugin.version>
+        <maven.shade.plugin.version>3.6.0</maven.shade.plugin.version>
+        <maven.surefire.plugin.version>3.2.5</maven.surefire.plugin.version>
+        <fmt-maven-plugin.version>2.29</fmt-maven-plugin.version>
+
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>${aws.sdk.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${jackson.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- ===== AWS Lambda runtime ===== -->
+        <dependency>
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-lambda-java-core</artifactId>
+            <version>${aws.lambda.core.version}</version>
+        </dependency>
+        <!-- API Gateway proxy request/response event types. -->
+        <dependency>
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-lambda-java-events</artifactId>
+            <version>${aws.lambda.events.version}</version>
+        </dependency>
+
+        <!-- ===== JSON ===== -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+
+        <!-- ===== AWS SDK v2: SQS + lean HTTP client ===== -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>sqs</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>url-connection-client</artifactId>
+        </dependency>
+
+        <!-- ===== Logging ===== -->
+        <!--
+          SLF4J API + the Simple backend. Lambda captures stdout/stderr into
+          CloudWatch Logs, so a plain stdout logger is all that is needed; this
+          avoids coupling to a specific log4j2 version. Configured via
+          src/main/resources/simplelogger.properties.
+        -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+
+        <!-- ===== Test ===== -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-junit-jupiter</artifactId>
+            <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>${project.artifactId}</finalName>
+        <plugins>
+            <!-- Code formatter (Google Java Format) -->
+            <plugin>
+                <groupId>com.spotify.fmt</groupId>
+                <artifactId>fmt-maven-plugin</artifactId>
+                <version>${fmt-maven-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>format</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven.compiler.plugin.version}</version>
+                <configuration>
+                    <release>21</release>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${maven.surefire.plugin.version}</version>
+            </plugin>
+
+            <!--
+              Shade plugin builds the single deployable fat jar Lambda runs.
+              The ServicesResourceTransformer merges META-INF/services files so
+              SLF4J (and the AWS SDK) service lookups keep working in the fat jar.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>${maven.shade.plugin.version}</version>
+                <configuration>
+                    <createDependencyReducedPom>false</createDependencyReducedPom>
+                </configuration>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <transformers>
+                                <transformer
+                                        implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
